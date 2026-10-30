@@ -1,9 +1,11 @@
 """Telegram adapter for the apartment-hunt bot."""
 from __future__ import annotations
 
+import hashlib
 import html
 import logging
 import os
+import re
 import tempfile
 from datetime import time as dtime
 
@@ -16,7 +18,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -66,39 +68,57 @@ def who(update: Update) -> str:
     return (u.first_name or u.username or str(u.id)) if u else "?"
 
 
+def full_title(apt: dict) -> str:
+    """Card headline: address, neighborhood, city (whatever we have)."""
+    parts = [apt.get(k) for k in ("address", "neighborhood", "city") if apt.get(k)]
+    return ", ".join(parts) if parts else f"דירה #{apt['id']}"
+
+
+def status_line(apt: dict) -> str:
+    emoji, name = STATUSES[apt["status"]]
+    when = fmt_when(apt.get("viewing_at"))
+    if apt["status"] == "scheduled" and when:
+        return f"{emoji} <b>{name}</b> ליום {when}"
+    if apt["status"] in ("seen", "want") and when:
+        return f"{emoji} <b>{name}</b> (ביקור ביום {when})"
+    if apt["status"] == "new":
+        return f"{emoji} <b>{name}</b>, עוד לא יצרנו קשר"
+    return f"{emoji} <b>{name}</b>"
+
+
 def card_text(apt: dict) -> str:
-    lines = [f"<b>#{apt['id']} · {esc(title(apt))}</b>"]
-    if apt.get("neighborhood") and apt.get("address"):
-        lines.append(f"📍 {esc(apt['neighborhood'])}")
-    facts = " · ".join(x for x in (fmt_price(apt.get("price")), fmt_rooms(apt.get("rooms"))) if x)
+    lines = [f"<b>{esc(full_title(apt))}</b>"]
+    contact = " ".join(x for x in (apt.get("contact_name"), apt.get("phone")) if x)
+    facts = " · ".join(x for x in (fmt_price(apt.get("price")), fmt_rooms(apt.get("rooms")), esc(contact)) if x)
     if facts:
-        lines.append(f"💰 {facts}")
-    contact = " · ".join(x for x in (apt.get("contact_name"), apt.get("phone")) if x)
-    if contact:
-        lines.append(f"👤 {esc(contact)}")
-    if apt.get("viewing_at") and apt["status"] in ("scheduled", "seen", "want"):
-        lines.append(f"🗓 ביקור: {fmt_when(apt['viewing_at'])}")
-    lines.append(f"\nסטטוס: <b>{label(apt['status'])}</b>")
-    if apt.get("url"):
-        src = apt.get("source") or "קישור"
-        lines.append(f'🔗 <a href="{esc(apt["url"])}">המודעה ({esc(src)})</a>')
-    notes = store.notes(apt["id"])
+        lines.append(facts)
+    lines += ["", status_line(apt)]
+    notes = store.notes(apt["id"], limit=10)
     if notes:
-        lines.append("")
-        lines += [f"📝 <i>{esc(n['user'])}:</i> {esc(n['value'])}" for n in notes]
+        body = "\n".join(f"<i>{esc(n['user'])}:</i> {esc(n['value'][:300])}" for n in notes)
+        lines.append(f"<blockquote expandable>{body}</blockquote>")
+    footer = f"<code>#{apt['id']}</code>"
+    if apt.get("source"):
+        footer += f" · {esc(apt['source'])}"
+    lines.append(footer)
     if store.missing_details(apt):
-        lines.append("\n<i>↩️ עשו Reply לכרטיס עם טקסט המודעה כדי שאשלים פרטים</i>")
+        lines.append("<i>↩️ חסרים פרטים: עשו Reply לכרטיס עם טקסט המודעה</i>")
     return "\n".join(lines)
 
 
 def card_keyboard(apt: dict) -> InlineKeyboardMarkup:
     if apt["status"] in core.FINAL:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ החזר לטיפול", callback_data=f"re:{apt['id']}")]])
-    buttons = []
-    for st in TRANSITIONS[apt["status"]]:
-        text = "📅 שינוי מועד" if (st == "scheduled" and apt["status"] == "scheduled") else label(st)
-        buttons.append(InlineKeyboardButton(text, callback_data=f"st:{apt['id']}:{st}"))
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        rows = [[InlineKeyboardButton("↩️ החזר לטיפול", callback_data=f"re:{apt['id']}")]]
+    else:
+        buttons = []
+        for st in TRANSITIONS[apt["status"]]:
+            text = "📅 שינוי מועד" if (st == "scheduled" and apt["status"] == "scheduled") else label(st)
+            buttons.append(InlineKeyboardButton(text, callback_data=f"st:{apt['id']}:{st}"))
+        rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    bottom = [InlineKeyboardButton("✏️ תיקון פרטים", callback_data=f"ed:{apt['id']}")]
+    if apt.get("url"):
+        bottom.append(InlineKeyboardButton("🔗 פתיחת המודעה", url=apt["url"]))
+    rows.append(bottom)
     return InlineKeyboardMarkup(rows)
 
 
@@ -178,6 +198,64 @@ async def ask_when(bot, chat_id: int, apt_id: int, retry: bool = False, reply_to
         reply_to_message_id=reply_to,
     )
     store.register_msg(chat_id, msg.message_id, apt_id, "ask_when")
+
+
+FIX_PROMPT = ("✏️ מה לתקן ב<b>{title}</b>? (#{id})\n"
+              "עשו Reply, שורה לכל שדה, למשל:\n"
+              "<code>עיר: תל אביב</code>\n"
+              "<code>שכונה: נווה צדק</code>\n"
+              "או במילים: <i>זה ברמת גן, לא בתל אביב</i>\n"
+              "שדות: כתובת, שכונה, עיר, מחיר, חדרים, איש קשר, טלפון. כדי למחוק שדה כתבו <code>-</code>")
+
+
+async def ask_fix(bot, chat_id: int, apt_id: int, retry: bool = False, reply_to: int | None = None):
+    apt = store.get(apt_id)
+    q = ("לא הבנתי מה לתקן 🤔 נסו שורה כמו <code>שכונה: נווה צדק</code>" if retry
+         else FIX_PROMPT.format(title=esc(full_title(apt)), id=apt_id))
+    msg = await bot.send_message(
+        chat_id, q, parse_mode=ParseMode.HTML,
+        reply_markup=ForceReply(input_field_placeholder="שכונה: נווה צדק"),
+        reply_to_message_id=reply_to,
+    )
+    store.register_msg(chat_id, msg.message_id, apt_id, "ask_fix")
+
+
+FIX_PREFIX_RE = re.compile(r"^\s*(תיקון|לתקן|תקן)\s*[:\-]?\s*")
+
+
+async def apply_fix(update: Update, ctx: ContextTypes.DEFAULT_TYPE, apt_id: int, text: str) -> bool:
+    """Apply a correction to an apartment. Returns False if nothing could be understood."""
+    msg = update.effective_message
+    apt = store.get(apt_id)
+    raw = core.parse_field_lines(text)
+    if not raw:
+        await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+        raw = await llm.extract_fix(apt, FIX_PREFIX_RE.sub("", text)) or {}
+    fields, bad = {}, []
+    for k, v in raw.items():
+        try:
+            fields[k] = core.clean_value(k, v)
+        except ValueError:
+            bad.append(core.FIELD_NAMES[k])
+    if not fields:
+        if bad:
+            await msg.reply_text(f"לא הצלחתי לקרוא את הערך של: {', '.join(bad)}")
+            return True
+        return False
+    changed = store.update_fields(apt_id, fields, who(update))
+    if not changed:
+        await msg.reply_text("הפרטים כבר כאלה, לא שיניתי כלום.")
+        return True
+    await refresh_cards(ctx.bot, apt_id)
+    shown = []
+    for k, v in changed.items():
+        if v is None:
+            shown.append(f"{core.FIELD_NAMES[k]}: נמחק")
+        else:
+            shown.append(f"{core.FIELD_NAMES[k]}: {fmt_price(v) if k == 'price' else fmt_rooms(v) if k == 'rooms' else v}")
+    note = f"\nלא הצלחתי לקרוא: {', '.join(bad)}" if bad else ""
+    await msg.reply_text("✏️ עודכן\n" + "\n".join(shown) + note)
+    return True
 
 
 async def react(msg: Message, emoji: str = "👍"):
@@ -272,6 +350,12 @@ async def handle_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, apt_id: i
                        f"📅 {esc(user)}: קבענו ל<b>{fmt_when(when)}</b> — {esc(title(apt))} (#{apt_id})")
         return
 
+    # Answer to "what to fix?", or a reply that starts with "תיקון" / has "שדה: ערך" lines
+    if kind == "ask_fix" or FIX_PREFIX_RE.match(text) or core.is_fix_text(text):
+        if not await apply_fix(update, ctx, apt_id, text):
+            await ask_fix(ctx.bot, chat_id, apt_id, retry=True, reply_to=msg.message_id)
+        return
+
     # Reply with a link to an apartment that has none
     urls = message_urls(msg)
     if urls and not apt.get("url"):
@@ -303,6 +387,11 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     apt = store.get(apt_id)
     if not apt:
         await q.answer("לא נמצא")
+        return
+
+    if parts[0] == "ed":
+        await q.answer()
+        await ask_fix(ctx.bot, chat_id, apt_id)
         return
 
     if parts[0] == "re":
@@ -338,23 +427,83 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ================================================================ commands
 
-HELP = """<b>🏠 בוט חיפוש דירה</b>
+HELP = f"""<b>🏠 מה אפשר לעשות</b>
 
-<b>הוספה:</b> שלחו לקבוצה קישור למודעה, רצוי עם הטקסט שלה, או העבירו (forward) מודעה.
-<b>עדכון:</b> לחצו על הכפתורים בכרטיס.
-<b>הערה:</b> עשו Reply לכרטיס ותכתבו מה שתרצו.
-<b>השלמת פרטים:</b> Reply לכרטיס עם טקסט המודעה.
+<b>➕ דירה חדשה</b>
+שלחו קישור למודעה, רצוי עם הטקסט שלה באותה הודעה, או העבירו (Forward) מודעה.
 
-/open — כל מה שפתוח
-/week — ביקורים בשבוע הקרוב
-/all — הכל, כולל מה שדחינו
-/card 12 — להקפיץ את כרטיס 12
-/digest — סיכום עכשיו
-/export — גיבוי של מסד הנתונים"""
+<b>🔄 עדכון סטטוס</b>
+כפתורים בכרטיס. כשקובעים ביקור, אשאל מתי.
+
+<b>✏️ תיקון פרטים</b>
+כפתור "✏️ תיקון פרטים" בכרטיס, או Reply לכרטיס עם שורה כמו:
+<code>עיר: תל אביב</code>
+<code>שכונה: נווה צדק</code>
+אפשר גם במילים: <i>תיקון: זה ברמת גן</i>
+
+<b>📝 הערה</b>
+Reply לכרטיס עם כל טקסט אחר.
+
+<b>📋 פקודות</b>
+/open · כל מה שפתוח, לפי סטטוס
+/week · ביקורים בשבוע הקרוב
+/all · הכול, כולל מה שדחינו
+/card 12 · להקפיץ את כרטיס 12
+/digest · סיכום עכשיו (נשלח לבד כל בוקר ב-{DIGEST_TIME})
+/export · גיבוי של מסד הנתונים
+/help · לשלוח ולנעוץ מחדש את ההודעה הזו"""
+
+COMMANDS = [
+    ("open", "כל מה שפתוח"),
+    ("week", "ביקורים בשבוע הקרוב"),
+    ("all", "הכול, כולל מה שדחינו"),
+    ("card", "להקפיץ כרטיס, למשל /card 12"),
+    ("digest", "סיכום עכשיו"),
+    ("export", "גיבוי של מסד הנתונים"),
+    ("help", "מה אפשר לעשות"),
+]
+
+
+async def pin_help(bot, chat_id: int, force_new: bool = False) -> bool:
+    """Keep one pinned help message per chat. Edits it in place when HELP changes;
+    with force_new, sends a fresh one at the bottom. Returns False if pinning failed."""
+    key = f"help:{chat_id}"
+    digest = hashlib.sha1(HELP.encode()).hexdigest()[:12]
+    stored = store.get_meta(key)
+    old_id, old_digest = (int(stored.split("|")[0]), stored.split("|")[1]) if stored else (None, None)
+
+    if old_id and not force_new:
+        if old_digest == digest:
+            return True
+        try:
+            await bot.edit_message_text(HELP, chat_id=chat_id, message_id=old_id, parse_mode=ParseMode.HTML)
+            store.set_meta(key, f"{old_id}|{digest}")
+            return True
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                store.set_meta(key, f"{old_id}|{digest}")
+                return True
+            log.info("could not edit pinned help: %s", e)
+
+    msg = await bot.send_message(chat_id, HELP, parse_mode=ParseMode.HTML)
+    store.set_meta(key, f"{msg.message_id}|{digest}")
+    try:
+        if old_id:
+            try:
+                await bot.unpin_chat_message(chat_id, message_id=old_id)
+            except TelegramError:
+                pass
+        await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
+        return True
+    except TelegramError as e:
+        log.info("could not pin help: %s", e)
+        return False
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(HELP, parse_mode=ParseMode.HTML)
+    if not await pin_help(ctx.bot, update.effective_chat.id, force_new=True):
+        await update.effective_message.reply_text(
+            "כדי שאוכל לנעוץ את ההודעה, הפכו אותי למנהל בקבוצה עם הרשאה לנעיצת הודעות.")
 
 
 async def cmd_chatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -463,8 +612,17 @@ async def setup_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "הבוט עוד לא מוגדר. הריצו /chatid בקבוצה והגדירו את ALLOWED_CHAT_ID.")
 
 
+async def post_init(app: Application):
+    await app.bot.set_my_commands(COMMANDS)
+    if ALLOWED is not None:
+        try:
+            await pin_help(app.bot, ALLOWED)
+        except TelegramError as e:
+            log.warning("could not send help to %s: %s", ALLOWED, e)
+
+
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("chatid", cmd_chatid))
 
     if ALLOWED is None:

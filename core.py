@@ -234,9 +234,75 @@ CREATE TABLE IF NOT EXISTS messages(
 );
 CREATE INDEX IF NOT EXISTS idx_events_apt ON events(apartment_id);
 CREATE INDEX IF NOT EXISTS idx_messages_apt ON messages(apartment_id);
+-- small key/value store (e.g. the pinned help message per chat)
+CREATE TABLE IF NOT EXISTS meta(
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
-DETAIL_FIELDS = ["address", "neighborhood", "price", "rooms", "contact_name", "phone"]
+DETAIL_FIELDS = ["address", "neighborhood", "city", "price", "rooms", "contact_name", "phone"]
+
+# Hebrew names, used in edit confirmations and for "field: value" corrections
+FIELD_NAMES = {
+    "address": "כתובת",
+    "neighborhood": "שכונה",
+    "city": "עיר",
+    "price": "מחיר",
+    "rooms": "חדרים",
+    "contact_name": "איש קשר",
+    "phone": "טלפון",
+}
+FIELD_ALIASES = {
+    "כתובת": "address", "רחוב": "address",
+    "שכונה": "neighborhood",
+    "עיר": "city", "ישוב": "city", "יישוב": "city",
+    "מחיר": "price", "שכירות": "price",
+    "חדרים": "rooms",
+    "איש קשר": "contact_name", "שם": "contact_name",
+    "טלפון": "phone", "פלאפון": "phone", "נייד": "phone",
+}
+_CLEAR = {"-", "—", "אין", "למחוק", "מחק"}
+_FIELD_LINE_RE = re.compile(
+    r"^\s*(" + "|".join(sorted(map(re.escape, FIELD_ALIASES), key=len, reverse=True)) + r")\s*[:=]\s*(.+?)\s*$"
+)
+
+
+def clean_value(field: str, value):
+    """Normalize one field value. Returns None for 'clear', raises ValueError if invalid."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s in _CLEAR or s == "":
+        return None
+    if field == "price":
+        digits = re.sub(r"[^\d]", "", s)
+        p = int(digits) if digits else 0
+        if not 300 <= p <= 100_000:
+            raise ValueError(s)
+        return p
+    if field == "rooms":
+        r = float(s.replace(",", ".").replace("חדרים", "").replace("חד׳", "").strip())
+        if not 0.5 <= r <= 15:
+            raise ValueError(s)
+        return r
+    return s
+
+
+def parse_field_lines(text: str) -> dict:
+    """Parse 'שכונה: נווה צדק' style lines. Returns {field: value} (value None = clear)."""
+    out = {}
+    for line in (text or "").splitlines():
+        m = _FIELD_LINE_RE.match(line)
+        if m:
+            out[FIELD_ALIASES[m.group(1)]] = m.group(2)
+    return out
+
+
+def is_fix_text(text: str) -> bool:
+    """True only if every non-empty line is a 'field: value' line (so pasted ad text isn't mistaken for a fix)."""
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    return bool(lines) and len(lines) <= len(FIELD_NAMES) and all(_FIELD_LINE_RE.match(l) for l in lines)
 
 
 class TransitionError(ValueError):
@@ -254,6 +320,18 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(SCHEMA)
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(apartments)")}
+        if "city" not in cols:  # added after the first release
+            self.db.execute("ALTER TABLE apartments ADD COLUMN city TEXT")
+        self.db.commit()
+
+    # -- meta
+    def get_meta(self, key: str) -> str | None:
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str):
+        self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, value))
         self.db.commit()
 
     # -- events
@@ -270,10 +348,10 @@ class Store:
         f = {k: (fields or {}).get(k) for k in DETAIL_FIELDS}
         ts = now_iso()
         cur = self.db.execute(
-            """INSERT INTO apartments(url,source,address,neighborhood,price,rooms,contact_name,phone,
+            """INSERT INTO apartments(url,source,address,neighborhood,city,price,rooms,contact_name,phone,
                                       status,raw_text,added_by,created_at,updated_at)
-               VALUES (?,?,?,?,?,?,?,?,'new',?,?,?,?)""",
-            (url, source_of(url), f["address"], f["neighborhood"], f["price"], f["rooms"],
+               VALUES (?,?,?,?,?,?,?,?,?,'new',?,?,?,?)""",
+            (url, source_of(url), f["address"], f["neighborhood"], f["city"], f["price"], f["rooms"],
              f["contact_name"], f["phone"], raw_text, user, ts, ts),
         )
         apt_id = cur.lastrowid
@@ -311,6 +389,19 @@ class Store:
         self._event(apt_id, user, "details", ",".join(filled))
         self.db.commit()
         return filled
+
+    def update_fields(self, apt_id: int, fields: dict, user: str) -> dict:
+        """Overwrite the given fields (a correction). Returns {field: new_value} that actually changed."""
+        apt = self.get(apt_id)
+        changed = {}
+        for k, v in fields.items():
+            if k in DETAIL_FIELDS and apt.get(k) != v:
+                self.db.execute(f"UPDATE apartments SET {k}=? WHERE id=?", (v, apt_id))
+                changed[k] = v
+        if changed:
+            self._event(apt_id, user, "edit", ",".join(f"{k}={v}" for k, v in changed.items()))
+            self.db.commit()
+        return changed
 
     def missing_details(self, apt: dict) -> bool:
         return not apt.get("address") and not apt.get("price")

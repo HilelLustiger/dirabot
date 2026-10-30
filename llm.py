@@ -54,7 +54,8 @@ Return ONLY a JSON object, no prose:
 {
   "is_listing": true/false,     // is this text an apartment ad / listing details?
   "address": string|null,       // street + number if present, in Hebrew as written
-  "neighborhood": string|null,  // neighborhood and/or city
+  "neighborhood": string|null,  // neighborhood only, without the city
+  "city": string|null,          // city / town, in Hebrew
   "price": integer|null,        // monthly rent in ILS
   "rooms": number|null,         // e.g. 3 or 3.5
   "contact_name": string|null,
@@ -65,7 +66,7 @@ Use null for anything not stated. Do not guess."""
 
 def _clean_listing(d: dict) -> dict:
     out = {"is_listing": bool(d.get("is_listing"))}
-    for k in ("address", "neighborhood", "contact_name", "phone"):
+    for k in ("address", "neighborhood", "city", "contact_name", "phone"):
         v = d.get(k)
         out[k] = str(v).strip() if v not in (None, "", "null") else None
     try:
@@ -86,6 +87,29 @@ def _clean_listing(d: dict) -> dict:
 async def extract_listing(text: str) -> dict | None:
     d = await _ask_json(EXTRACT_SYSTEM, f"<ad>\n{text[:4000]}\n</ad>")
     return _clean_listing(d) if d else None
+
+
+# ---------------------------------------------------------------- corrections
+
+FIX_SYSTEM = """You apply a user's correction to an apartment record (Israeli rental, Hebrew).
+You get the current fields as JSON and the user's correction in free Hebrew text.
+Return ONLY a JSON object with the fields the user wants to change, nothing else:
+keys from: address, neighborhood, city, price, rooms, contact_name, phone.
+- address: street + number. neighborhood: neighborhood only. city: city / town only.
+- To clear a field, set it to null.
+- If the text does not ask to change any field, return {}.
+Do not change fields the user did not mention."""
+
+
+async def extract_fix(current: dict, text: str) -> dict | None:
+    """Returns {field: raw_value} to change, {} if nothing, or None if the LLM is unavailable."""
+    keys = ("address", "neighborhood", "city", "price", "rooms", "contact_name", "phone")
+    cur = {k: current.get(k) for k in keys}
+    d = await _ask_json(FIX_SYSTEM, f"<current>{json.dumps(cur, ensure_ascii=False)}</current>\n"
+                                    f"<correction>{text[:1000]}</correction>", max_tokens=200)
+    if d is None:
+        return None
+    return {k: d[k] for k in keys if k in d}
 
 
 # ---------------------------------------------------------------- viewing time
