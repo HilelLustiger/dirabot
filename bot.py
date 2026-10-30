@@ -467,37 +467,47 @@ COMMANDS = [
 async def pin_help(bot, chat_id: int, force_new: bool = False) -> bool:
     """Keep one pinned help message per chat. Edits it in place when HELP changes;
     with force_new, sends a fresh one at the bottom. Returns False if pinning failed."""
+    # meta value: "<msg_id>|<help digest>|<1 if pinned else 0>"
     key = f"help:{chat_id}"
     digest = hashlib.sha1(HELP.encode()).hexdigest()[:12]
-    stored = store.get_meta(key)
-    old_id, old_digest = (int(stored.split("|")[0]), stored.split("|")[1]) if stored else (None, None)
+    parts = (store.get_meta(key) or "").split("|")
+    old_id = int(parts[0]) if parts[0] else None
+    old_digest = parts[1] if len(parts) > 1 else None
+    pinned = len(parts) > 2 and parts[2] == "1"
+
+    async def pin(msg_id: int) -> bool:
+        try:
+            await bot.pin_chat_message(chat_id, msg_id, disable_notification=True)
+            return True
+        except TelegramError as e:
+            log.info("could not pin help: %s", e)
+            return False
 
     if old_id and not force_new:
-        if old_digest == digest:
-            return True
-        try:
-            await bot.edit_message_text(HELP, chat_id=chat_id, message_id=old_id, parse_mode=ParseMode.HTML)
-            store.set_meta(key, f"{old_id}|{digest}")
-            return True
-        except BadRequest as e:
-            if "not modified" in str(e).lower():
-                store.set_meta(key, f"{old_id}|{digest}")
-                return True
-            log.info("could not edit pinned help: %s", e)
+        current = old_digest == digest
+        if not current:
+            try:
+                await bot.edit_message_text(HELP, chat_id=chat_id, message_id=old_id, parse_mode=ParseMode.HTML)
+                current = True
+            except BadRequest as e:
+                current = "not modified" in str(e).lower()
+                if not current:
+                    log.info("could not edit pinned help: %s", e)
+        if current:
+            # e.g. the bot was made admin after it first tried to pin
+            pinned = pinned or await pin(old_id)
+            store.set_meta(key, f"{old_id}|{digest}|{int(pinned)}")
+            return pinned
 
     msg = await bot.send_message(chat_id, HELP, parse_mode=ParseMode.HTML)
-    store.set_meta(key, f"{msg.message_id}|{digest}")
-    try:
-        if old_id:
-            try:
-                await bot.unpin_chat_message(chat_id, message_id=old_id)
-            except TelegramError:
-                pass
-        await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
-        return True
-    except TelegramError as e:
-        log.info("could not pin help: %s", e)
-        return False
+    if old_id:
+        try:
+            await bot.unpin_chat_message(chat_id, message_id=old_id)
+        except TelegramError:
+            pass
+    pinned = await pin(msg.message_id)
+    store.set_meta(key, f"{msg.message_id}|{digest}|{int(pinned)}")
+    return pinned
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
